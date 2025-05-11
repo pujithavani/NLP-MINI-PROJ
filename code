@@ -1,0 +1,347 @@
+!pip install torch torchvision torchaudio transformers scikit-learn pandas plotly
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+from transformers import BertTokenizer, BertModel, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import accuracy_score, classification_report
+
+# 1. Load & Preprocess
+df = pd.read_csv("/content/amazon_reviews_8000_labeled.csv")
+df = df[['name','reviews.text','reviews.rating']].dropna()
+df = df[df['reviews.rating'].astype(str).str.isnumeric()]
+df['reviews.rating'] = df['reviews.rating'].astype(int)
+df['sentiment'] = df['reviews.rating'].map({
+    1:'Worst',2:'Bad',3:'Neutral',4:'Good',5:'Excellent'
+})
+label_map = {'Worst':0,'Bad':1,'Neutral':2,'Good':3,'Excellent':4}
+df['label'] = df['sentiment'].map(label_map)
+
+print("Loaded:", len(df), "rows; label distribution:")
+print(df['sentiment'].value_counts())
+# 2. Train/Validation Split
+X_train, X_val, y_train, y_val = train_test_split(
+    df['reviews.text'], df['label'],
+    test_size=0.1,
+    stratify=df['label'],
+    random_state=42
+)
+
+# 3. Tokenizer & Dataset
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+class ReviewDataset(Dataset):
+    def __init__(self, texts, labels):
+        self.texts = texts.tolist()
+        self.labels = labels.tolist()
+    def __len__(self):
+        return len(self.texts)
+    def __getitem__(self, idx):
+        enc = tokenizer(
+            self.texts[idx],
+            padding='max_length',
+            truncation=True,
+            max_length=128,
+            return_tensors='pt'
+        )
+        return {
+            'input_ids':      enc['input_ids'].squeeze(0),
+            'attention_mask': enc['attention_mask'].squeeze(0),
+            'labels':         torch.tensor(self.labels[idx], dtype=torch.long)
+        }
+
+train_ds = ReviewDataset(X_train, y_train)
+val_ds   = ReviewDataset(X_val,   y_val)
+
+train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
+val_loader   = DataLoader(val_ds,   batch_size=64)
+
+print("Train batches:", len(train_loader), "Val batches:", len(val_loader))
+# 4. Model Definition
+class CustomBERT(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bert    = BertModel.from_pretrained('bert-base-uncased')
+        self.dropout = nn.Dropout(0.3)
+        self.fc      = nn.Linear(768, len(label_map))
+    def forward(self, input_ids, attention_mask):
+        out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        x   = out.pooler_output
+        return self.fc(self.dropout(x))
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model  = CustomBERT().to(device)
+
+# 5. Loss, Optimizer & Scheduler
+class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+criterion     = nn.CrossEntropyLoss(weight=class_weights)
+
+optimizer   = AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
+total_steps  = len(train_loader) * 6  # up to 6 epochs
+warmup_steps = int(0.1 * total_steps)
+scheduler    = get_linear_schedule_with_warmup(
+    optimizer, warmup_steps, total_steps
+)
+
+print("Model, loss, optimizer, scheduler ready.")
+# 6. Training Loop w/ Progress
+best_val_acc = 0
+patience, trials = 2, 0
+
+for epoch in range(6):
+    print(f"\n=== Epoch {epoch+1}/6 ===")
+    model.train()
+    batch_losses = []
+    for idx, batch in enumerate(train_loader, 1):
+        ids   = batch['input_ids'].to(device)
+        mask  = batch['attention_mask'].to(device)
+        labels= batch['labels'].to(device)
+
+        logits = model(ids, mask)
+        loss   = criterion(logits, labels)
+        batch_losses.append(loss.item())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        if idx % 20 == 0:
+            print(f"  Batch {idx}/{len(train_loader)} — Loss: {loss.item():.4f}")
+
+    # Validation
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for b in val_loader:
+            ids    = b['input_ids'].to(device)
+            mask   = b['attention_mask'].to(device)
+            lbls   = b['labels'].to(device)
+            out    = model(ids, mask)
+            preds  = torch.argmax(out, dim=1)
+            all_preds.extend(preds.cpu().tolist())
+            all_labels.extend(lbls.cpu().tolist())
+
+    val_acc = accuracy_score(all_labels, all_preds)
+    print(f"Epoch {epoch+1} — Train Loss: {np.mean(batch_losses):.4f} | Val Acc: {val_acc:.4f}")
+
+    # Early stopping
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        trials = 0
+        torch.save(model.state_dict(), 'best_model.pt')
+        print("  → New best model saved.")
+    else:
+        trials += 1
+        print(f"  → No improvement ({trials}/{patience})")
+        if trials > patience:
+            print("  → Early stopping.")
+            break
+import torch
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+# —— 1. Load best model & set eval mode ——
+model.load_state_dict(torch.load('best_model.pt'))
+model.eval()
+
+all_preds, all_labels, all_confs = [], [], []
+
+# —— 2. Run model on validation (or test) loader ——
+with torch.no_grad():
+    for batch in val_loader:
+        input_ids      = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels         = batch['labels'].to(device)
+
+        logits = model(input_ids, attention_mask)      # raw scores
+        probs  = F.softmax(logits, dim=1)               # convert to probabilities
+        confs, preds = torch.max(probs, dim=1)         # max prob & its index
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        all_confs.extend(confs.cpu().numpy())
+
+# —— 3. Compute overall accuracy ——
+acc = accuracy_score(all_labels, all_preds)
+print(f"🟢 Accuracy: {acc:.4f}")
+
+# —— 4. Classification report ——
+print("\n🧮 Classification Report:")
+print(classification_report(
+    all_labels,
+    all_preds,
+    target_names=list(label_map.keys())
+))
+
+# —— 5. Confusion matrix ——
+cm = confusion_matrix(all_labels, all_preds)
+cm_df = pd.DataFrame(
+    cm,
+    index=[f"True {l}" for l in label_map.keys()],
+    columns=[f"Pred {l}" for l in label_map.keys()]
+)
+print("\n📊 Confusion Matrix:")
+display(cm_df)
+
+# —— 6. Per-sample DataFrame with confidence ——
+eval_df = pd.DataFrame({
+    'True Label':  [list(label_map.keys())[l] for l in all_labels],
+    'Pred Label':  [list(label_map.keys())[p] for p in all_preds],
+    'Confidence':  all_confs
+})
+
+# Show the 10 lowest-confidence predictions
+print("\n🔍 Lowest-Confidence Predictions:")
+display(eval_df.nsmallest(10, 'Confidence'))
+# 15. Visualization — Bar Charts
+import plotly.express as px
+import plotly.graph_objects as go
+
+# Bar Chart - Sentiment Distribution
+fig = px.histogram(result_df, x='Predicted Sentiment', color='Predicted Sentiment',
+                   title='Predicted Sentiment Distribution', barmode='group')
+fig.show()
+
+# Bar Chart - Sentiment per Product
+top_products = result_df['Product'].value_counts().head(10).index.tolist()
+filtered = result_df[result_df['Product'].isin(top_products)]
+
+fig2 = px.histogram(filtered, x='Product', color='Predicted Sentiment',
+                    title='Sentiment per Product (Top 10)', barmode='group')
+fig2.show()
+
+# 16. Visualization — Interactive Pie Chart with Dropdown (Enhanced)
+
+# Define ordered sentiments
+sentiments = ['Worst', 'Bad', 'Neutral', 'Good', 'Excellent']
+products = sorted(result_df['Product'].unique())
+
+# Custom pie chart colors
+colors = ['#8D8D8D', '#FF9800', '#9E9E9E', '#42A5F5', '#00BCD4']
+
+# Create figure and add traces (one pie chart per product)
+fig3 = go.Figure()
+for i, prod in enumerate(products):
+    sub = result_df[result_df['Product'] == prod]
+    counts = sub['Predicted Sentiment'].value_counts().reindex(sentiments, fill_value=0)
+
+    fig3.add_trace(go.Pie(
+        labels=sentiments,
+        values=counts.values,
+        name=prod,
+        hole=0,  # 0 for solid pie (set to 0.4 for donut)
+        textinfo='percent+label',
+        insidetextorientation='auto',
+        marker=dict(colors=colors),
+        visible=(i == 0)  # Only show the first one initially
+    ))
+
+# Dropdown buttons
+buttons = []
+for i, prod in enumerate(products):
+    vis = [False] * len(products)
+    vis[i] = True
+    buttons.append(dict(
+        label=prod,
+        method='update',
+        args=[{'visible': vis}, {'title': f"Sentiment Breakdown for {prod}"}]
+    ))
+
+# Layout update with dropdown
+fig3.update_layout(
+    title=f"Sentiment Breakdown for {products[0]}",
+    showlegend=True,
+    updatemenus=[dict(
+        active=0,
+        buttons=buttons,
+        x=0.05, y=1.15,
+        xanchor='left',
+        yanchor='top',
+        direction='down'
+    )]
+)
+
+fig3.show()
+  import torch
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+import plotly.express as px
+import pandas as pd
+import numpy as np
+
+# Assumes you already have in scope:
+# - model (your trained CustomBERT instance)
+# - val_loader (your validation DataLoader)
+# - device ("cuda" or "cpu")
+
+# 1) Set model to evaluation mode
+model.eval()
+
+# 2) Collect true labels and predictions
+true_labels, pred_labels = [], []
+
+with torch.no_grad():
+    for batch in val_loader:  # use val_loader instead of undefined dataloader
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+
+        logits = model(input_ids, attention_mask)
+        preds = torch.argmax(logits, dim=1)
+
+        true_labels.extend(labels.cpu().numpy())
+        pred_labels.extend(preds.cpu().numpy())
+
+true_labels = np.array(true_labels)
+pred_labels = np.array(pred_labels)
+
+# 3) Define class names (must match your training label_map ordering)
+class_names = ['Worst', 'Bad', 'Neutral', 'Good', 'Excellent']
+
+# 4) Confusion Matrix
+cm = confusion_matrix(true_labels, pred_labels)
+plt.figure(figsize=(8,6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=class_names, yticklabels=class_names)
+plt.title('Confusion Matrix')
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.show()
+
+# 5) Classification Report
+def_labels = list(class_names)
+print("Classification Report:")
+print(classification_report(true_labels, pred_labels, target_names=def_labels))
+
+# 6) Bar Plot - Prediction Counts
+pf = pd.Series(pred_labels).value_counts().sort_index()
+bar_df = pd.DataFrame({
+    'Class': [class_names[i] for i in pf.index],
+    'Count': pf.values
+})
+fig_bar = px.bar(bar_df, x='Class', y='Count',
+                 title='Predictions per Class',
+                 category_orders={'Class': class_names})
+fig_bar.show()
+
+# 7) Pie Chart - Distribution
+fig_pie = px.pie(bar_df, names='Class', values='Count',
+                 title='Predicted Sentiment Distribution', hole=0.4)
+fig_pie.show()
+
+
+
+
+
+
